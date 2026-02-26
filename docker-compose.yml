@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  workflowmail:
+    build: .
+    ports:
+      - "7071:80"
+    environment:
+      - ACS_ENDPOINT=${ACS_ENDPOINT:-https://your-acs.communication.azure.com}
+      - SENDER_ADDRESS=${SENDER_ADDRESS:-DoNotReply@example.azurecomm.net}
+      - AzureWebJobsStorage=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1
+    volumes:
+      - ./function:/home/site/wwwroot:ro
+    depends_on:
+      - azurite
+
+  # Azurite storage emulator for local development
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "10002:10002"

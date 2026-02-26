@@ -1,0 +1,118 @@
+# WorkflowMail - Reusable workflow for sending email from any repo
+#
+# Usage in another repo's workflow:
+#
+#   jobs:
+#     notify:
+#       uses: <org>/workflowmail/.github/workflows/email-reusable.yml@main
+#       with:
+#         to: "recipient@example.com"
+#         subject: "Build Report for ${{ github.repository }}"
+#         body: "Build ${{ github.run_id }} completed."
+#       secrets: inherit
+
+name: Send Email (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      to:
+        description: 'Recipient email (single or comma-separated)'
+        required: true
+        type: string
+      subject:
+        description: 'Email subject'
+        required: true
+        type: string
+      body:
+        description: 'Plain text body'
+        required: false
+        default: ''
+        type: string
+      html:
+        description: 'HTML body (optional, overrides plain text display)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Function Key
+        id: func-key
+        env:
+          FUNC_NAME: ${{ vars.AZURE_FUNC_NAME }}
+          RG_NAME: ${{ vars.AZURE_RG }}
+        run: |
+          KEY=$(az functionapp function keys list \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --function-name "send_email" \
+            --query "default" -o tsv 2>/dev/null || \
+          az functionapp keys list \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --query "functionKeys.default" -o tsv)
+          echo "::add-mask::$KEY"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Send Email
+        env:
+          FUNC_NAME: ${{ vars.AZURE_FUNC_NAME }}
+          FUNC_KEY: ${{ steps.func-key.outputs.key }}
+          INPUT_TO: ${{ inputs.to }}
+          INPUT_SUBJECT: ${{ inputs.subject }}
+          INPUT_BODY: ${{ inputs.body }}
+          INPUT_HTML: ${{ inputs.html }}
+        run: |
+          FUNC_URL="https://${FUNC_NAME}.azurewebsites.net/api/send?code=${FUNC_KEY}"
+
+          # Build JSON payload safely using jq
+          # Handle comma-separated recipients by converting to JSON array
+          TO_JSON=$(echo "$INPUT_TO" | python3 -c "
+          import sys, json
+          addrs = [a.strip() for a in sys.stdin.read().strip().split(',') if a.strip()]
+          print(json.dumps(addrs if len(addrs) > 1 else addrs[0]))
+          ")
+
+          PAYLOAD=$(jq -n \
+            --argjson to "$TO_JSON" \
+            --arg subject "$INPUT_SUBJECT" \
+            --arg body "$INPUT_BODY" \
+            --arg html "$INPUT_HTML" \
+            '{to: $to, subject: $subject} +
+             (if $body != "" then {body: $body} else {} end) +
+             (if $html != "" then {html: $html} else {} end)')
+
+          HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            -X POST "$FUNC_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          cat /tmp/response.json
+
+          if ! echo "$HTTP_CODE" | grep -qE '^[0-9]+$'; then
+            echo "::error::Email send failed — no valid HTTP response"
+            exit 1
+          elif [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Email send failed (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+
+          echo "::notice::Email sent successfully!"
+
+      - name: Azure Logout
+        if: always()
+        run: az logout

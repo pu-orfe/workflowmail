@@ -1,0 +1,32 @@
+# WorkflowMail
+.workflowmail.conf
+local.settings.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Azure Functions
+bin/
+obj/
+.python_packages/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Development coordination
+SHARED_TASK_NOTES.md
+
+# Claude
+.claude/
+CLAUDE.md

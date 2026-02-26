@@ -1,0 +1,112 @@
+# WorkflowMail - Example GitHub Action for sending email via Azure OIDC + ACS
+#
+# 100% secretless: No passwords, tokens, or keys stored in GitHub.
+# Authentication uses OpenID Connect (OIDC) Workload Identity Federation.
+#
+# Required GitHub repository variables (NOT secrets — these are public IDs):
+#   AZURE_CLIENT_ID       - App Registration client ID
+#   AZURE_TENANT_ID       - Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID - Azure subscription ID
+#   AZURE_RG              - Resource group name
+#   AZURE_FUNC_NAME       - Function App name
+
+name: Send Email Report
+
+on:
+  # Trigger on workflow_dispatch for manual testing
+  workflow_dispatch:
+    inputs:
+      to:
+        description: 'Recipient email address'
+        required: true
+        type: string
+      subject:
+        description: 'Email subject'
+        required: true
+        default: 'Workflow Report'
+        type: string
+      body:
+        description: 'Email body (plain text)'
+        required: true
+        default: 'This is a test email from GitHub Actions via WorkflowMail.'
+        type: string
+
+  # Can also trigger on other events — uncomment as needed:
+  # push:
+  #   branches: [main]
+  # schedule:
+  #   - cron: '0 9 * * 1'  # Every Monday at 9 AM UTC
+
+permissions:
+  id-token: write   # Required for OIDC token request
+  contents: read
+
+jobs:
+  send-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login (OIDC - no secrets)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get Function Key (retrieved at runtime, never stored)
+        id: func-key
+        env:
+          FUNC_NAME: ${{ vars.AZURE_FUNC_NAME }}
+          RG_NAME: ${{ vars.AZURE_RG }}
+        run: |
+          KEY=$(az functionapp function keys list \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --function-name "send_email" \
+            --query "default" -o tsv 2>/dev/null || \
+          az functionapp keys list \
+            --name "$FUNC_NAME" \
+            --resource-group "$RG_NAME" \
+            --query "functionKeys.default" -o tsv)
+          echo "::add-mask::$KEY"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Send Email
+        env:
+          FUNC_NAME: ${{ vars.AZURE_FUNC_NAME }}
+          FUNC_KEY: ${{ steps.func-key.outputs.key }}
+          INPUT_TO: ${{ inputs.to }}
+          INPUT_SUBJECT: ${{ inputs.subject }}
+          INPUT_BODY: ${{ inputs.body }}
+        run: |
+          FUNC_URL="https://${FUNC_NAME}.azurewebsites.net/api/send?code=${FUNC_KEY}"
+
+          # Build JSON payload safely using jq
+          PAYLOAD=$(jq -n \
+            --arg to "$INPUT_TO" \
+            --arg subject "$INPUT_SUBJECT" \
+            --arg body "$INPUT_BODY" \
+            '{to: $to, subject: $subject, body: $body}')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$FUNC_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "Response: $BODY"
+          echo "HTTP Status: $HTTP_CODE"
+
+          if ! echo "$HTTP_CODE" | grep -qE '^[0-9]+$'; then
+            echo "::error::Email send failed — no valid HTTP response"
+            exit 1
+          elif [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::error::Email send failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "::notice::Email sent successfully!"
+
+      - name: Azure Logout
+        if: always()
+        run: az logout
