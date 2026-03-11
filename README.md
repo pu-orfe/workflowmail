@@ -1,12 +1,14 @@
 # WorkflowMail
 
-Fully secretless email delivery from GitHub Actions via Azure OIDC + Azure Communication Services.
+Secretless* email delivery from GitHub Actions via Azure OIDC + Azure Communication Services. Also usable as a general-purpose email API from any HTTP client (Drupal Webforms, CI systems, scripts).
 
 ```
 GitHub Action (OIDC) → Azure Login → Get Function Key → Azure Function → Managed Identity → ACS Email
 ```
 
 No passwords, tokens, or credential rotation. OIDC tokens are ephemeral. Function keys are retrieved at runtime and never stored.
+
+> **\*** The GitHub Actions path is fully secretless — no credentials are stored anywhere. Non-OIDC integrations (e.g., Drupal Webforms) require a static function key, which is a stored credential. See [Security Model](#security-model) for details.
 
 ## Why
 
@@ -226,11 +228,19 @@ docker-compose up --build
 
 ## Security Model
 
+**GitHub Actions (fully secretless):**
 - **No stored credentials** — GitHub authenticates to Azure via OIDC. No client secrets, no certificates, no passwords.
 - **Ephemeral tokens** — OIDC tokens are short-lived and scoped to a single workflow run.
 - **Function-level auth** — The Azure Function requires a function key, retrieved at runtime via Azure CLI (never stored in GitHub).
-- **Managed Identity** — The Function App authenticates to ACS using its system-assigned Managed Identity. No connection strings.
 - **Scoped access** — The GitHub Service Principal has Contributor on the resource group only. If the GitHub account is compromised, the attacker gets time-limited OIDC tokens with no extractable credentials.
+
+**Non-OIDC clients (Drupal, scripts, etc.):**
+- **Function key required** — External callers authenticate with a static function key passed in the URL. This is a stored credential — treat it like a password.
+- **Scoped blast radius** — The key only grants access to the email-sending endpoint. It cannot access other Azure resources.
+- **Rotation** — Rotate keys with `az functionapp function keys set`. An OAuth upgrade path is tracked in [Issue #1](https://github.com/pu-orfe/workflowmail/issues/1).
+
+**Shared (all callers):**
+- **Managed Identity** — The Function App authenticates to ACS using its system-assigned Managed Identity. No connection strings.
 
 ## File Structure
 
