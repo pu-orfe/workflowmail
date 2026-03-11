@@ -1,8 +1,7 @@
-version: "3.8"
-
 services:
   workflowmail:
     build: .
+    platform: linux/amd64
     ports:
       - "7071:80"
     environment:

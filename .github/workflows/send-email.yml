@@ -67,6 +67,10 @@ jobs:
             --name "$FUNC_NAME" \
             --resource-group "$RG_NAME" \
             --query "functionKeys.default" -o tsv)
+          if [ -z "$KEY" ] || [ "$KEY" = "None" ]; then
+            echo "::error::Could not retrieve function key. Is the function deployed?"
+            exit 1
+          fi
           echo "::add-mask::$KEY"
           echo "key=$KEY" >> "$GITHUB_OUTPUT"
 

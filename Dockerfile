@@ -7,7 +7,7 @@
 #           -e SENDER_ADDRESS=DoNotReply@xxx.azurecomm.net \
 #           workflowmail
 
-FROM mcr.microsoft.com/azure-functions/python:4-python3.11
+FROM --platform=linux/amd64 mcr.microsoft.com/azure-functions/python:4-python3.11
 
 ENV AzureWebJobsScriptRoot=/home/site/wwwroot \
     AzureFunctionsJobHost__Logging__Console__IsEnabled=true

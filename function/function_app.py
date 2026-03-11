@@ -77,29 +77,29 @@ def send_email(req: func.HttpRequest) -> func.HttpResponse:
     }
 
     try:
-        endpoint = os.environ["ACS_ENDPOINT"]
+        endpoint = os.environ.get("ACS_ENDPOINT", "")
+        if not endpoint:
+            return func.HttpResponse(
+                json.dumps({"error": "ACS_ENDPOINT not configured. Run './deploy.sh status' to refresh."}),
+                status_code=500,
+                mimetype="application/json",
+            )
         credential = DefaultAzureCredential()
         client = EmailClient(endpoint, credential)
 
         poller = client.begin_send(message)
         result = poller.result()
 
-        logging.info("Email sent successfully: %s", result.message_id)
+        logging.info("Email sent successfully: %s", result["id"])
         return func.HttpResponse(
             json.dumps({
                 "status": "sent",
-                "messageId": result.message_id,
+                "messageId": result["id"],
             }),
             status_code=200,
             mimetype="application/json",
         )
 
-    except KeyError:
-        return func.HttpResponse(
-            json.dumps({"error": "ACS_ENDPOINT environment variable not set"}),
-            status_code=500,
-            mimetype="application/json",
-        )
     except Exception as e:
         logging.error("Failed to send email: %s", str(e))
         return func.HttpResponse(

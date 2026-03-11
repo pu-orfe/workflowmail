@@ -41,12 +41,16 @@ retry() {
     local attempt=1
 
     while true; do
-        if "$@" 2>/dev/null; then
-            return 0
-        fi
         if [ "$attempt" -ge "$max_attempts" ]; then
+            # Final attempt: show stderr for debugging
+            if "$@"; then
+                return 0
+            fi
             warn "Failed after ${max_attempts} attempts: ${desc}"
             return 1
+        fi
+        if "$@" 2>/dev/null; then
+            return 0
         fi
         attempt=$((attempt + 1))
         info "  Retrying ${desc} (attempt ${attempt}/${max_attempts})..."
@@ -74,6 +78,7 @@ usage() {
     echo "  ${BLUE}status${RESET}      Show current deployment status"
     echo "  ${CYAN}test${RESET}        Send a test email to verify deployment"
     echo "  ${MAGENTA}add-cred${RESET}    Add OIDC credential for another GitHub repo"
+    echo "  ${DIM}logs${RESET}        Stream live Function App logs"
     echo "  ${YELLOW}help${RESET}        Show this help message"
     echo ""
     echo "${BOLD}Architecture:${RESET}"
@@ -166,14 +171,13 @@ save_config() {
     local value="$2"
     # Create config file if it doesn't exist
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo "# workflowmail deployment configuration" > "$CONFIG_FILE"
-        echo "# Auto-generated — do not edit manually" >> "$CONFIG_FILE"
+        printf '%s\n%s\n' "# workflowmail deployment configuration" "# Auto-generated — do not edit manually" > "$CONFIG_FILE"
     fi
     # Remove existing key if present, then append
     if [ -f "$CONFIG_FILE" ]; then
-        local tmp
-        tmp=$(grep -v "^${key}=" "$CONFIG_FILE" 2>/dev/null || true)
-        echo "$tmp" > "$CONFIG_FILE"
+        local tmp_file="${CONFIG_FILE}.tmp"
+        grep -v "^${key}=" "$CONFIG_FILE" > "$tmp_file" 2>/dev/null || true
+        mv "$tmp_file" "$CONFIG_FILE"
     fi
     echo "${key}=${value}" >> "$CONFIG_FILE"
 }
@@ -256,7 +260,11 @@ gather_config() {
     prompt_value "Azure Tenant ID" "TENANT_ID" "$(load_config TENANT_ID "$current_tenant")"
 
     # Set subscription
-    az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1
+    if ! az account set --subscription "$SUBSCRIPTION_ID" 2>/dev/null; then
+        error "Could not set subscription '${SUBSCRIPTION_ID}'."
+        error "Verify the ID and that you have access: az account list -o table"
+        exit 1
+    fi
 
     divider
 
@@ -333,7 +341,7 @@ gather_config() {
 
     # Check function app name availability via a quick DNS probe
     local func_check
-    func_check=$(curl -s -o /dev/null -w "%{http_code}" "https://${FUNC_APP_NAME}.azurewebsites.net" 2>/dev/null || echo "000")
+    func_check=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://${FUNC_APP_NAME}.azurewebsites.net" 2>/dev/null || echo "000")
     if [ "$func_check" != "000" ] && [ "$func_check" != "404" ]; then
         warn "Function App name '${FUNC_APP_NAME}' may already be in use (got HTTP ${func_check})."
         warn "Choose a different resource prefix if this is not your existing deployment."
@@ -374,8 +382,8 @@ deploy_acs() {
     if ! az communication create \
         --name "$ACS_NAME" \
         --resource-group "$RESOURCE_GROUP" \
-        --location "global" \
-        --data-location "unitedstates" \
+        --location "Global" \
+        --data-location "United States" \
         --output none 2>/dev/null; then
         # Check if it already exists (create fails if it does)
         if az communication show --name "$ACS_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
@@ -394,35 +402,57 @@ deploy_acs() {
     local email_body
     email_body=$(cat <<'EJSON'
 {
-  "location": "global",
+  "location": "Global",
   "properties": {
-    "dataLocation": "unitedstates"
+    "dataLocation": "United States"
   }
 }
 EJSON
 )
-    az rest --method PUT \
+    if ! az rest --method PUT \
         --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}?api-version=${API_VERSION_EMAIL}" \
         --body "$email_body" \
-        --output none 2>/dev/null
-    success "Email Communication Service created."
+        --output none 2>/dev/null; then
+        # PUT is idempotent — check if it already exists
+        if az rest --method GET \
+            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}?api-version=${API_VERSION_EMAIL}" \
+            --output none 2>/dev/null; then
+            warn "Email Service '${EMAIL_SERVICE_NAME}' already exists. Reusing."
+        else
+            error "Failed to create Email Communication Service."
+            error "Check subscription quotas and permissions."
+            exit 1
+        fi
+    else
+        success "Email Communication Service created."
+    fi
 
     # Create Azure-managed domain
     step "Creating Azure-managed email domain (this may take a minute)..."
     local domain_body
     domain_body=$(cat <<'DJSON'
 {
-  "location": "global",
+  "location": "Global",
   "properties": {
     "domainManagement": "AzureManagedDomain"
   }
 }
 DJSON
 )
-    az rest --method PUT \
+    if ! az rest --method PUT \
         --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}/domains/AzureManagedDomain?api-version=${API_VERSION_EMAIL}" \
         --body "$domain_body" \
-        --output none 2>/dev/null
+        --output none 2>/dev/null; then
+        # Check if the domain already exists
+        if az rest --method GET \
+            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}/domains/AzureManagedDomain?api-version=${API_VERSION_EMAIL}" \
+            --output none 2>/dev/null; then
+            warn "Azure-managed domain already exists. Reusing."
+        else
+            error "Failed to create Azure-managed email domain."
+            exit 1
+        fi
+    fi
 
     # Poll until domain is provisioned
     local domain_status="Creating"
@@ -434,10 +464,18 @@ DJSON
             --query "properties.provisioningState" -o tsv 2>/dev/null || echo "Creating")
         attempts=$((attempts + 1))
         echo -n "."
+        # Break early on terminal failure states
+        if [ "$domain_status" = "Failed" ] || [ "$domain_status" = "Canceled" ]; then
+            break
+        fi
     done
     echo ""
 
-    if [ "$domain_status" != "Succeeded" ]; then
+    if [ "$domain_status" = "Failed" ] || [ "$domain_status" = "Canceled" ]; then
+        error "Domain provisioning ${domain_status}."
+        error "Check the Azure portal for details, then re-run './deploy.sh deploy'."
+        exit 1
+    elif [ "$domain_status" != "Succeeded" ]; then
         warn "Domain provisioning still in progress (status: ${domain_status}). It may complete shortly."
     else
         success "Azure-managed email domain created."
@@ -798,25 +836,35 @@ configure_github_variables() {
     step "Setting GitHub repository variables on ${BOLD}${gh_repo}${RESET}..."
 
     local failed=0
-    gh variable set AZURE_CLIENT_ID --body "$APP_CLIENT_ID" --repo "$gh_repo" 2>/dev/null \
-        && success "  AZURE_CLIENT_ID set" \
-        || { warn "  Failed to set AZURE_CLIENT_ID"; failed=1; }
+    if gh variable set AZURE_CLIENT_ID --body "$APP_CLIENT_ID" --repo "$gh_repo" 2>/dev/null; then
+        success "  AZURE_CLIENT_ID set"
+    else
+        warn "  Failed to set AZURE_CLIENT_ID"; failed=1
+    fi
 
-    gh variable set AZURE_TENANT_ID --body "$TENANT_ID" --repo "$gh_repo" 2>/dev/null \
-        && success "  AZURE_TENANT_ID set" \
-        || { warn "  Failed to set AZURE_TENANT_ID"; failed=1; }
+    if gh variable set AZURE_TENANT_ID --body "$TENANT_ID" --repo "$gh_repo" 2>/dev/null; then
+        success "  AZURE_TENANT_ID set"
+    else
+        warn "  Failed to set AZURE_TENANT_ID"; failed=1
+    fi
 
-    gh variable set AZURE_SUBSCRIPTION_ID --body "$SUBSCRIPTION_ID" --repo "$gh_repo" 2>/dev/null \
-        && success "  AZURE_SUBSCRIPTION_ID set" \
-        || { warn "  Failed to set AZURE_SUBSCRIPTION_ID"; failed=1; }
+    if gh variable set AZURE_SUBSCRIPTION_ID --body "$SUBSCRIPTION_ID" --repo "$gh_repo" 2>/dev/null; then
+        success "  AZURE_SUBSCRIPTION_ID set"
+    else
+        warn "  Failed to set AZURE_SUBSCRIPTION_ID"; failed=1
+    fi
 
-    gh variable set AZURE_RG --body "$RESOURCE_GROUP" --repo "$gh_repo" 2>/dev/null \
-        && success "  AZURE_RG set" \
-        || { warn "  Failed to set AZURE_RG"; failed=1; }
+    if gh variable set AZURE_RG --body "$RESOURCE_GROUP" --repo "$gh_repo" 2>/dev/null; then
+        success "  AZURE_RG set"
+    else
+        warn "  Failed to set AZURE_RG"; failed=1
+    fi
 
-    gh variable set AZURE_FUNC_NAME --body "$FUNC_APP_NAME" --repo "$gh_repo" 2>/dev/null \
-        && success "  AZURE_FUNC_NAME set" \
-        || { warn "  Failed to set AZURE_FUNC_NAME"; failed=1; }
+    if gh variable set AZURE_FUNC_NAME --body "$FUNC_APP_NAME" --repo "$gh_repo" 2>/dev/null; then
+        success "  AZURE_FUNC_NAME set"
+    else
+        warn "  Failed to set AZURE_FUNC_NAME"; failed=1
+    fi
 
     echo ""
     if [ "$failed" -eq 0 ]; then
@@ -965,21 +1013,31 @@ add_credential() {
         local target_repo="${new_org}/${new_repo}"
         if prompt_yes_no "Auto-set these variables on ${BOLD}${target_repo}${RESET}?"; then
             echo ""
-            gh variable set AZURE_CLIENT_ID --body "$APP_CLIENT_ID" --repo "$target_repo" 2>/dev/null \
-                && success "  AZURE_CLIENT_ID set" \
-                || warn "  Failed to set AZURE_CLIENT_ID"
-            gh variable set AZURE_TENANT_ID --body "$TENANT_ID" --repo "$target_repo" 2>/dev/null \
-                && success "  AZURE_TENANT_ID set" \
-                || warn "  Failed to set AZURE_TENANT_ID"
-            gh variable set AZURE_SUBSCRIPTION_ID --body "$SUBSCRIPTION_ID" --repo "$target_repo" 2>/dev/null \
-                && success "  AZURE_SUBSCRIPTION_ID set" \
-                || warn "  Failed to set AZURE_SUBSCRIPTION_ID"
-            gh variable set AZURE_RG --body "$RESOURCE_GROUP" --repo "$target_repo" 2>/dev/null \
-                && success "  AZURE_RG set" \
-                || warn "  Failed to set AZURE_RG"
-            gh variable set AZURE_FUNC_NAME --body "$FUNC_APP_NAME" --repo "$target_repo" 2>/dev/null \
-                && success "  AZURE_FUNC_NAME set" \
-                || warn "  Failed to set AZURE_FUNC_NAME"
+            if gh variable set AZURE_CLIENT_ID --body "$APP_CLIENT_ID" --repo "$target_repo" 2>/dev/null; then
+                success "  AZURE_CLIENT_ID set"
+            else
+                warn "  Failed to set AZURE_CLIENT_ID"
+            fi
+            if gh variable set AZURE_TENANT_ID --body "$TENANT_ID" --repo "$target_repo" 2>/dev/null; then
+                success "  AZURE_TENANT_ID set"
+            else
+                warn "  Failed to set AZURE_TENANT_ID"
+            fi
+            if gh variable set AZURE_SUBSCRIPTION_ID --body "$SUBSCRIPTION_ID" --repo "$target_repo" 2>/dev/null; then
+                success "  AZURE_SUBSCRIPTION_ID set"
+            else
+                warn "  Failed to set AZURE_SUBSCRIPTION_ID"
+            fi
+            if gh variable set AZURE_RG --body "$RESOURCE_GROUP" --repo "$target_repo" 2>/dev/null; then
+                success "  AZURE_RG set"
+            else
+                warn "  Failed to set AZURE_RG"
+            fi
+            if gh variable set AZURE_FUNC_NAME --body "$FUNC_APP_NAME" --repo "$target_repo" 2>/dev/null; then
+                success "  AZURE_FUNC_NAME set"
+            else
+                warn "  Failed to set AZURE_FUNC_NAME"
+            fi
             echo ""
         fi
     fi
@@ -1142,6 +1200,34 @@ status() {
         az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1 || true
     fi
 
+    # Auto-refresh ACS endpoint if it was empty during initial deploy
+    local ACS_ENDPOINT
+    ACS_ENDPOINT=$(load_config "ACS_ENDPOINT" "")
+    if [ -z "$ACS_ENDPOINT" ] && [ -n "$ACS_NAME" ]; then
+        info "ACS endpoint was empty — checking if it's available now..."
+        local refreshed_endpoint
+        refreshed_endpoint=$(az rest --method GET \
+            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/communicationServices/${ACS_NAME}?api-version=${API_VERSION_COMM}" \
+            --query "properties.hostName" -o tsv 2>/dev/null || echo "")
+        if [ -n "$refreshed_endpoint" ] && [ "$refreshed_endpoint" != "None" ]; then
+            ACS_ENDPOINT="https://${refreshed_endpoint}"
+            save_config "ACS_ENDPOINT" "$ACS_ENDPOINT"
+            success "ACS endpoint resolved: ${BOLD}${ACS_ENDPOINT}${RESET}"
+            # Update function app settings with resolved endpoint
+            if [ -n "$FUNC_APP_NAME" ]; then
+                info "Updating Function App ACS endpoint..."
+                az functionapp config appsettings set \
+                    --name "$FUNC_APP_NAME" \
+                    --resource-group "$RESOURCE_GROUP" \
+                    --settings "ACS_ENDPOINT=${ACS_ENDPOINT}" \
+                    --output none 2>/dev/null && success "Function App ACS endpoint updated."
+            fi
+        else
+            warn "ACS endpoint still unavailable."
+        fi
+        echo ""
+    fi
+
     # Auto-refresh sender domain if it was pending during initial deploy
     if [ "$SENDER_DOMAIN" = "pending" ] && [ -n "$EMAIL_SERVICE_NAME" ]; then
         info "Sender domain was pending — checking if it's available now..."
@@ -1177,6 +1263,7 @@ status() {
     echo "    Function App:     ${FUNC_APP_NAME}"
     echo "    Function URL:     ${FUNC_APP_URL}"
     echo "    ACS Resource:     ${ACS_NAME}"
+    echo "    ACS Endpoint:     ${ACS_ENDPOINT:-${YELLOW}empty${RESET}}"
     echo "    Sender Address:   ${SENDER_ADDRESS}"
     echo ""
 
@@ -1198,6 +1285,32 @@ status() {
     # Check function app
     if [ -n "$FUNC_APP_NAME" ] && az functionapp show --name "$FUNC_APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
         echo "    Function App:     ${GREEN}running${RESET}"
+
+        # Probe the function endpoint
+        local probe_code
+        probe_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://${FUNC_APP_NAME}.azurewebsites.net/api/send" 2>/dev/null || echo "000")
+        if [ "$probe_code" = "000" ]; then
+            echo "    Function HTTP:    ${YELLOW}unreachable (cold start or DNS)${RESET}"
+        elif [ "$probe_code" = "401" ]; then
+            echo "    Function HTTP:    ${GREEN}responding (auth required — expected)${RESET}"
+        elif [ "$probe_code" = "405" ]; then
+            echo "    Function HTTP:    ${GREEN}responding (method not allowed — expected for GET)${RESET}"
+        else
+            echo "    Function HTTP:    ${YELLOW}HTTP ${probe_code}${RESET}"
+        fi
+
+        # Check function registration
+        local func_reg
+        func_reg=$(az functionapp function show \
+            --name "$FUNC_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --function-name "send_email" \
+            --query "name" -o tsv 2>/dev/null || echo "")
+        if [ -n "$func_reg" ] && [ "$func_reg" != "None" ]; then
+            echo "    Function Code:    ${GREEN}deployed (send_email)${RESET}"
+        else
+            echo "    Function Code:    ${RED}not deployed or not registered${RESET}"
+        fi
     else
         echo "    Function App:     ${RED}not found${RESET}"
     fi
@@ -1291,9 +1404,9 @@ test_email() {
     else
         # Safe fallback — escape double quotes in values
         local esc_to esc_subject esc_body
-        esc_to=$(echo "$test_to" | sed 's/"/\\"/g')
-        esc_subject=$(echo "$test_subject" | sed 's/"/\\"/g')
-        esc_body=$(echo "$test_body" | sed 's/"/\\"/g')
+        esc_to="${test_to//\"/\\\"}"
+        esc_subject="${test_subject//\"/\\\"}"
+        esc_body="${test_body//\"/\\\"}"
         payload="{\"to\":\"${esc_to}\",\"subject\":\"${esc_subject}\",\"body\":\"${esc_body}\"}"
     fi
 
@@ -1306,6 +1419,7 @@ test_email() {
     local http_code=""
     response=$(curl -s -w "\n%{http_code}" -X POST "$func_url" \
         -H "Content-Type: application/json" \
+        --connect-timeout 10 --max-time 120 \
         -d "$payload" 2>/dev/null)
 
     http_code=$(echo "$response" | tail -1)
@@ -1330,6 +1444,34 @@ test_email() {
     echo ""
     echo "${BOLD}${CYAN}  └────────────────────────────────────────────────────────┘${RESET}"
     echo ""
+}
+
+# ── Live Logs ──────────────────────────────────────────────────────────
+stream_logs() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        error "No deployment configuration found."
+        info "Run '${BOLD}$0 deploy${RESET}' first."
+        exit 1
+    fi
+
+    SUBSCRIPTION_ID=$(load_config "SUBSCRIPTION_ID" "")
+    RESOURCE_GROUP=$(load_config "RESOURCE_GROUP" "")
+    FUNC_APP_NAME=$(load_config "FUNC_APP_NAME" "")
+
+    if [ -z "$FUNC_APP_NAME" ] || [ -z "$RESOURCE_GROUP" ]; then
+        error "Incomplete configuration. Re-run '${BOLD}$0 deploy${RESET}'."
+        exit 1
+    fi
+
+    if [ -n "$SUBSCRIPTION_ID" ]; then
+        az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1 || true
+    fi
+
+    info "Streaming logs for ${BOLD}${FUNC_APP_NAME}${RESET}... (Ctrl+C to stop)"
+    echo ""
+    az functionapp log tail \
+        --name "$FUNC_APP_NAME" \
+        --resource-group "$RESOURCE_GROUP"
 }
 
 # ── Main ────────────────────────────────────────────────────────────────
@@ -1357,6 +1499,9 @@ main() {
         add-cred|add-credential)
             check_prerequisites
             add_credential
+            ;;
+        logs|log)
+            stream_logs
             ;;
         help|-h|--help)
             usage

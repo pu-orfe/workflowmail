@@ -139,6 +139,61 @@ For cross-repo use, add federated credentials for each calling repo:
 
 This creates a federated credential and optionally sets the required GitHub variables on the target repo via `gh` CLI.
 
+### Drupal 10 Webforms
+
+The Azure Function's HTTP API works with any client that can POST JSON — including Drupal 10's built-in **Remote Post** webform handler. No site admin access or custom modules required.
+
+#### 1. Get your function key
+
+```bash
+az functionapp function keys list \
+  --name <your-func-name> \
+  --resource-group <your-rg> \
+  --function-name send_email \
+  --query "default" -o tsv
+```
+
+#### 2. Add a Remote Post handler
+
+In Drupal, go to your Webform → **Settings** → **Emails/Handlers** → **Add handler** → **Remote Post**.
+
+| Setting | Value |
+|---------|-------|
+| URL | `https://<func-name>.azurewebsites.net/api/send?code=<function-key>` |
+| Type | JSON |
+| Method | POST |
+
+#### 3. Map form fields to the email payload
+
+In the handler's **Custom data** (Completed) field, use Drupal tokens to map your webform fields:
+
+```yaml
+to: 'admin@example.com'
+subject: 'New submission from [webform_submission:values:name]'
+body: '[webform_submission:values:message]'
+```
+
+For HTML email:
+
+```yaml
+to: 'admin@example.com'
+subject: 'Contact form: [webform_submission:values:name]'
+html: |
+  <h2>New Contact Form Submission</h2>
+  <p><strong>Name:</strong> [webform_submission:values:name]</p>
+  <p><strong>Email:</strong> [webform_submission:values:email]</p>
+  <p><strong>Message:</strong> [webform_submission:values:message]</p>
+```
+
+To send a confirmation to the submitter and a copy to an admin, add two separate Remote Post handlers — one with `to: '[webform_submission:values:email]'` and one with `to: 'admin@example.com'`.
+
+#### Security notes for Drupal integration
+
+- The function key is stored in Drupal's handler config. Anyone who can edit the webform can see it.
+- The key only grants the ability to send email through your ACS instance — no other Azure access.
+- Rotate the key if compromised: `az functionapp function keys set --name <func> --resource-group <rg> --function-name send_email --key-name default --key-value <new-key>`
+- Unlike the GitHub Actions flow (which uses OIDC and never stores credentials), the Drupal integration relies on a static function key. This is standard for server-to-server calls from a trusted backend.
+
 ## Function API
 
 The Azure Function accepts POST requests to `/api/send`:
