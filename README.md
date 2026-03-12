@@ -10,10 +10,6 @@ No passwords, tokens, or credential rotation. OIDC tokens are ephemeral. Functio
 
 > **\*** The GitHub Actions path is fully secretless — no credentials are stored anywhere. Non-OIDC integrations (e.g., Drupal Webforms) require a static function key, which is a stored credential. See [Security Model](#security-model) for details.
 
-## Why
-
-When GitHub Actions workflows need to send email — build reports, failure alerts, scheduled digests — you usually end up storing SMTP credentials as repository secrets. WorkflowMail eliminates that entirely using Azure Workload Identity Federation (OIDC), so even if the GitHub account is compromised, there's no reusable credential an attacker can extract.
-
 ## Prerequisites
 
 - [Azure CLI](https://aka.ms/installazurecli) (`az`)
@@ -272,7 +268,3 @@ This deletes:
 - The local `.workflowmail.conf` file
 
 Remember to also remove the GitHub repository variables (`AZURE_CLIENT_ID`, etc.) after teardown.
-
-## License
-
-MIT
