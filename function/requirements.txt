@@ -1,3 +1,4 @@
 azure-functions>=1.21,<2
 azure-communication-email>=1.0,<2
 azure-identity>=1.19,<2
+requests>=2.28,<3

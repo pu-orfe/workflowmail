@@ -1,0 +1,18 @@
+# WorkflowMail - Containerized test runner
+# Runs pytest in an isolated environment matching the Azure Functions runtime.
+#
+# Build & run:
+#   docker build -f Dockerfile.test -t workflowmail-test .
+#   docker run --rm workflowmail-test
+
+FROM --platform=linux/amd64 python:3.11-slim
+
+WORKDIR /app
+
+COPY function/requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir pytest
+
+COPY function/ .
+
+CMD ["python", "-m", "pytest", "test_function_app.py", "-v"]

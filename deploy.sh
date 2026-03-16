@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  workflowmail - Azure OIDC + ACS Email Deployment                  ║
-# ║  Bash 3.2 compatible | Fully secretless | GitHub → Azure → Email   ║
+# ║  Bash 3.2 compatible | ACS or Graph | GitHub → Azure → Email        ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 set -euo pipefail
 
@@ -65,7 +65,7 @@ banner() {
     echo "  ║║║║ ║╠╦╝╠╩╗╠╣ ║  ║ ║║║║║║║╠═╣║║  "
     echo "  ╚╩╝╚═╝╩╚═╩ ╩╚  ╩═╝╚═╝╚╩╝╩ ╩╩ ╩╩╩═╝"
     echo "${RESET}"
-    echo "${DIM}  Azure OIDC + ACS Email · Fully Secretless${RESET}"
+    echo "${DIM}  Azure OIDC Email · ACS or Microsoft Graph${RESET}"
     echo ""
 }
 
@@ -82,10 +82,11 @@ usage() {
     echo "  ${YELLOW}help${RESET}        Show this help message"
     echo ""
     echo "${BOLD}Architecture:${RESET}"
-    echo "  GitHub Action → OIDC → Azure → Function → Managed Identity → ACS Email"
+    echo "  ACS backend:   GitHub Action → OIDC → Azure → Function → Managed Identity → ACS Email"
+    echo "  Graph backend:  GitHub Action → OIDC → Azure → Function → OAuth Token → Graph sendMail"
     echo ""
     echo "${BOLD}What gets created:${RESET}"
-    echo "  1. Resource Group with ACS + Email Service + Azure-managed domain"
+    echo "  1. Resource Group (+ ACS resources when using ACS backend)"
     echo "  2. App Registration + Service Principal + Federated Credential (OIDC)"
     echo "  3. Azure Function App with System-Assigned Managed Identity"
     echo "  4. Role assignments for least-privilege access"
@@ -132,18 +133,30 @@ check_prerequisites() {
         warn "Install: https://cli.github.com/"
     fi
 
-    # Azure CLI communication extension
-    if az extension show --name communication >/dev/null 2>&1; then
-        success "Azure CLI 'communication' extension found"
-    else
-        info "Installing Azure CLI 'communication' extension..."
-        az extension add --name communication --yes >/dev/null 2>&1
+    # Azure CLI communication extension (only needed for ACS backend)
+    local configured_backend
+    configured_backend=$(load_config "EMAIL_BACKEND" "acs")
+    if [ "$configured_backend" = "acs" ] || [ ! -f "$CONFIG_FILE" ]; then
         if az extension show --name communication >/dev/null 2>&1; then
-            success "Azure CLI 'communication' extension installed"
+            success "Azure CLI 'communication' extension found"
         else
-            error "Failed to install 'communication' extension. Install manually: az extension add --name communication"
-            missing=1
+            info "Installing Azure CLI 'communication' extension..."
+            az extension add --name communication --yes >/dev/null 2>&1
+            if az extension show --name communication >/dev/null 2>&1; then
+                success "Azure CLI 'communication' extension installed"
+            else
+                error "Failed to install 'communication' extension. Install manually: az extension add --name communication"
+                missing=1
+            fi
         fi
+    fi
+
+    # curl (needed for Graph device code flow)
+    if command -v curl >/dev/null 2>&1; then
+        success "curl found"
+    else
+        error "curl not found."
+        missing=1
     fi
 
     # Check Azure login
@@ -284,6 +297,37 @@ gather_config() {
 
     divider
 
+    # Email backend choice
+    echo ""
+    info "Email backend determines how the function sends email."
+    echo "${DIM}    acs   — Azure Communication Services (default, secretless via Managed Identity)${RESET}"
+    echo "${DIM}    graph — Microsoft Graph API (send as a real O365 mailbox via OAuth)${RESET}"
+    echo ""
+    local backend_input=""
+    prompt "Email backend [${YELLOW}$(load_config EMAIL_BACKEND "acs")${RESET}] (acs/graph): "
+    read -r backend_input
+    if [ -z "$backend_input" ]; then
+        backend_input=$(load_config EMAIL_BACKEND "acs")
+    fi
+    # Validate
+    while [ "$backend_input" != "acs" ] && [ "$backend_input" != "graph" ]; do
+        error "Invalid backend '${backend_input}'. Choose 'acs' or 'graph'."
+        prompt "Email backend (acs/graph): "
+        read -r backend_input
+    done
+    EMAIL_BACKEND="$backend_input"
+    save_config "EMAIL_BACKEND" "$EMAIL_BACKEND"
+
+    # If graph, prompt for sender email (O365 mailbox UPN)
+    if [ "$EMAIL_BACKEND" = "graph" ]; then
+        prompt_value "O365 sender email (the mailbox UPN, e.g. noreply@contoso.com)" \
+            "GRAPH_SENDER" "$(load_config GRAPH_SENDER "")"
+        SENDER_ADDRESS="$GRAPH_SENDER"
+        save_config "SENDER_ADDRESS" "$SENDER_ADDRESS"
+    fi
+
+    divider
+
     # Resource naming
     prompt_value "Resource prefix (lowercase, no spaces)" "RESOURCE_PREFIX" \
         "$(load_config RESOURCE_PREFIX "wfmail")"
@@ -297,8 +341,6 @@ gather_config() {
     local safe_prefix
     safe_prefix=$(echo "$RESOURCE_PREFIX" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')
     RESOURCE_GROUP="${RESOURCE_PREFIX}-rg"
-    ACS_NAME="${RESOURCE_PREFIX}-acs"
-    EMAIL_SERVICE_NAME="${RESOURCE_PREFIX}-email"
     FUNC_APP_NAME="${RESOURCE_PREFIX}-func"
     STORAGE_ACCOUNT="${safe_prefix}store"
     APP_REG_NAME="${RESOURCE_PREFIX}-github-oidc"
@@ -309,17 +351,27 @@ gather_config() {
     fi
 
     save_config "RESOURCE_GROUP" "$RESOURCE_GROUP"
-    save_config "ACS_NAME" "$ACS_NAME"
-    save_config "EMAIL_SERVICE_NAME" "$EMAIL_SERVICE_NAME"
     save_config "FUNC_APP_NAME" "$FUNC_APP_NAME"
     save_config "STORAGE_ACCOUNT" "$STORAGE_ACCOUNT"
     save_config "APP_REG_NAME" "$APP_REG_NAME"
 
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        ACS_NAME="${RESOURCE_PREFIX}-acs"
+        EMAIL_SERVICE_NAME="${RESOURCE_PREFIX}-email"
+        save_config "ACS_NAME" "$ACS_NAME"
+        save_config "EMAIL_SERVICE_NAME" "$EMAIL_SERVICE_NAME"
+    fi
+
     echo ""
     info "Resource names that will be created:"
     echo "${DIM}    Resource Group:    ${BOLD}${RESOURCE_GROUP}${RESET}"
-    echo "${DIM}    ACS:               ${BOLD}${ACS_NAME}${RESET}"
-    echo "${DIM}    Email Service:     ${BOLD}${EMAIL_SERVICE_NAME}${RESET}"
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        echo "${DIM}    ACS:               ${BOLD}${ACS_NAME}${RESET}"
+        echo "${DIM}    Email Service:     ${BOLD}${EMAIL_SERVICE_NAME}${RESET}"
+    else
+        echo "${DIM}    Email Backend:     ${BOLD}graph (Microsoft Graph API)${RESET}"
+        echo "${DIM}    Graph Sender:      ${BOLD}${GRAPH_SENDER}${RESET}"
+    fi
     echo "${DIM}    Function App:      ${BOLD}${FUNC_APP_NAME}${RESET}"
     echo "${DIM}    Storage Account:   ${BOLD}${STORAGE_ACCOUNT}${RESET}"
     echo "${DIM}    App Registration:  ${BOLD}${APP_REG_NAME}${RESET}"
@@ -550,6 +602,125 @@ DJSON
     info "ACS endpoint: ${BOLD}${ACS_ENDPOINT:-pending}${RESET}"
 }
 
+deploy_graph_oauth() {
+    step "Configuring Graph API permissions on App Registration..."
+
+    # Add delegated Mail.Send (e383f46e...) and offline_access (7427e0e9...) permissions
+    az ad app permission add --id "$APP_OBJECT_ID" \
+        --api "00000003-0000-0000-c000-000000000000" \
+        --api-permissions "e383f46e-2787-4529-855e-0e479a3ffac0=Scope" "7427e0e9-2fba-42fe-b0c0-848c9e6a8182=Scope" \
+        --output none 2>/dev/null || true
+    success "Delegated Mail.Send + offline_access permissions added."
+
+    # Enable public client flows (required for device code flow)
+    az ad app update --id "$APP_OBJECT_ID" --is-fallback-public-client true \
+        --output none 2>/dev/null
+    success "Public client flows enabled."
+
+    # Device code OAuth flow
+    step "Starting device code authentication flow..."
+    info "You will authenticate as the O365 mailbox account (${BOLD}${GRAPH_SENDER}${RESET})."
+    echo ""
+
+    local device_response
+    device_response=$(curl -s -X POST \
+        "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/devicecode" \
+        -d "client_id=${APP_CLIENT_ID}" \
+        -d "scope=https://graph.microsoft.com/Mail.Send offline_access")
+
+    local user_code device_code interval verification_uri
+    user_code=$(echo "$device_response" | jq -r '.user_code')
+    device_code=$(echo "$device_response" | jq -r '.device_code')
+    interval=$(echo "$device_response" | jq -r '.interval // 5')
+    verification_uri=$(echo "$device_response" | jq -r '.verification_uri // "https://microsoft.com/devicelogin"')
+
+    if [ -z "$user_code" ] || [ "$user_code" = "null" ]; then
+        error "Device code flow failed. Response:"
+        echo "$device_response" | jq . 2>/dev/null || echo "$device_response"
+        exit 1
+    fi
+
+    echo ""
+    echo "  ${BOLD}${CYAN}┌──────────────────────────────────────────────────┐${RESET}"
+    echo "  ${BOLD}${CYAN}│${RESET}  Go to: ${BOLD}${verification_uri}${RESET}"
+    echo "  ${BOLD}${CYAN}│${RESET}  Enter code: ${BOLD}${YELLOW}${user_code}${RESET}"
+    echo "  ${BOLD}${CYAN}│${RESET}"
+    echo "  ${BOLD}${CYAN}│${RESET}  ${DIM}Sign in as the sending account (${GRAPH_SENDER})${RESET}"
+    echo "  ${BOLD}${CYAN}└──────────────────────────────────────────────────┘${RESET}"
+    echo ""
+    info "Waiting for authentication..."
+
+    # Poll for token
+    local token_response=""
+    local poll_error=""
+    while true; do
+        sleep "$interval"
+        token_response=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+            -d "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+            -d "client_id=${APP_CLIENT_ID}" \
+            -d "device_code=${device_code}")
+
+        poll_error=$(echo "$token_response" | jq -r '.error // empty')
+
+        if [ -z "$poll_error" ]; then
+            # Success
+            break
+        elif [ "$poll_error" = "authorization_pending" ]; then
+            echo -n "."
+            continue
+        elif [ "$poll_error" = "slow_down" ]; then
+            interval=$((interval + 5))
+            continue
+        else
+            # authorization_declined, expired_token, or other error
+            echo ""
+            local error_desc
+            error_desc=$(echo "$token_response" | jq -r '.error_description // "Unknown error"')
+            error "Authentication failed: ${poll_error}"
+            error "${error_desc}"
+            exit 1
+        fi
+    done
+    echo ""
+
+    local refresh_token access_token
+    refresh_token=$(echo "$token_response" | jq -r '.refresh_token')
+    access_token=$(echo "$token_response" | jq -r '.access_token')
+
+    if [ -z "$refresh_token" ] || [ "$refresh_token" = "null" ]; then
+        error "No refresh token in response. Ensure offline_access scope was consented."
+        exit 1
+    fi
+    success "Authentication successful."
+
+    # Verify authenticated user
+    if [ -n "$access_token" ] && [ "$access_token" != "null" ]; then
+        local me_response auth_user
+        me_response=$(curl -s -H "Authorization: Bearer ${access_token}" \
+            "https://graph.microsoft.com/v1.0/me?%24select=userPrincipalName,displayName")
+        auth_user=$(echo "$me_response" | jq -r '.userPrincipalName // "unknown"')
+        info "Authenticated as: ${BOLD}${auth_user}${RESET}"
+    fi
+
+    GRAPH_REFRESH_TOKEN="$refresh_token"
+    save_config "GRAPH_REFRESH_TOKEN" "(stored in Function App settings)"
+    save_config "GRAPH_CLIENT_ID" "$APP_CLIENT_ID"
+    save_config "GRAPH_TENANT_ID" "$TENANT_ID"
+
+    # Store refresh token as Function App setting
+    step "Storing refresh token in Function App settings..."
+    az functionapp config appsettings set \
+        --name "$FUNC_APP_NAME" \
+        --resource-group "$RESOURCE_GROUP" \
+        --settings \
+            "GRAPH_REFRESH_TOKEN=${GRAPH_REFRESH_TOKEN}" \
+            "GRAPH_CLIENT_ID=${APP_CLIENT_ID}" \
+            "GRAPH_TENANT_ID=${TENANT_ID}" \
+        --output none 2>/dev/null
+    success "Graph credentials stored in Function App settings (encrypted at rest)."
+}
+
 deploy_app_registration() {
     step "Creating App Registration: ${BOLD}${APP_REG_NAME}${RESET}..."
 
@@ -711,58 +882,74 @@ deploy_function_app() {
     save_config "MI_PRINCIPAL_ID" "$MI_PRINCIPAL_ID"
     success "Managed Identity enabled (principalId: ${MI_PRINCIPAL_ID})"
 
-    # Assign ACS Contributor role to the Managed Identity
-    step "Assigning Contributor role to Managed Identity on ACS..."
-    local acs_scope="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/communicationServices/${ACS_NAME}"
+    # Backend-specific: MI-to-ACS role assignment (only for ACS backend)
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        step "Assigning Contributor role to Managed Identity on ACS..."
+        local acs_scope="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/communicationServices/${ACS_NAME}"
 
-    # Wait for the identity to propagate in Azure AD (can take 10-60s)
-    info "  Waiting for identity propagation..."
-    sleep 30
+        # Wait for the identity to propagate in Azure AD (can take 10-60s)
+        info "  Waiting for identity propagation..."
+        sleep 30
 
-    if ! retry 3 15 "MI Contributor role on ACS" \
-        az role assignment create \
-            --assignee-object-id "$MI_PRINCIPAL_ID" \
-            --assignee-principal-type "ServicePrincipal" \
-            --role "Contributor" \
-            --scope "$acs_scope" \
-            --output none; then
-        local existing_mi_role
-        existing_mi_role=$(az role assignment list \
-            --assignee "$MI_PRINCIPAL_ID" \
-            --role "Contributor" \
-            --scope "$acs_scope" \
-            --query "[0].id" -o tsv 2>/dev/null || echo "")
-        if [ -n "$existing_mi_role" ]; then
-            warn "  MI Contributor role on ACS already assigned."
-        else
-            warn "  Could not assign MI Contributor role on ACS. You may need to assign it manually."
+        if ! retry 3 15 "MI Contributor role on ACS" \
+            az role assignment create \
+                --assignee-object-id "$MI_PRINCIPAL_ID" \
+                --assignee-principal-type "ServicePrincipal" \
+                --role "Contributor" \
+                --scope "$acs_scope" \
+                --output none; then
+            local existing_mi_role
+            existing_mi_role=$(az role assignment list \
+                --assignee "$MI_PRINCIPAL_ID" \
+                --role "Contributor" \
+                --scope "$acs_scope" \
+                --query "[0].id" -o tsv 2>/dev/null || echo "")
+            if [ -n "$existing_mi_role" ]; then
+                warn "  MI Contributor role on ACS already assigned."
+            else
+                warn "  Could not assign MI Contributor role on ACS. You may need to assign it manually."
+            fi
+        fi
+
+        success "Managed Identity has Contributor access to ACS."
+
+        # Validate critical settings before configuring
+        if [ -z "$ACS_ENDPOINT" ]; then
+            warn "ACS endpoint is empty — the function will not be able to send email."
+            warn "You can fix this later: az functionapp config appsettings set --name ${FUNC_APP_NAME} --resource-group ${RESOURCE_GROUP} --settings ACS_ENDPOINT=<endpoint>"
+        fi
+        if [ "$SENDER_DOMAIN" = "pending" ]; then
+            warn "Sender domain is still pending — email sending will fail until this resolves."
+            warn "Check domain status: az rest --method GET --url 'https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}/domains/AzureManagedDomain?api-version=${API_VERSION_EMAIL}' --query 'properties.fromSenderDomain'"
         fi
     fi
 
-    success "Managed Identity has Contributor access to ACS."
-
-    # Validate critical settings before configuring
-    if [ -z "$ACS_ENDPOINT" ]; then
-        warn "ACS endpoint is empty — the function will not be able to send email."
-        warn "You can fix this later: az functionapp config appsettings set --name ${FUNC_APP_NAME} --resource-group ${RESOURCE_GROUP} --settings ACS_ENDPOINT=<endpoint>"
-    fi
-    if [ "$SENDER_DOMAIN" = "pending" ]; then
-        warn "Sender domain is still pending — email sending will fail until this resolves."
-        warn "Check domain status: az rest --method GET --url 'https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}/domains/AzureManagedDomain?api-version=${API_VERSION_EMAIL}' --query 'properties.fromSenderDomain'"
-    fi
-
-    # Configure app settings
+    # Configure app settings (backend-specific)
     step "Configuring Function App settings..."
-    az functionapp config appsettings set \
-        --name "$FUNC_APP_NAME" \
-        --resource-group "$RESOURCE_GROUP" \
-        --settings \
-            "ACS_ENDPOINT=${ACS_ENDPOINT}" \
-            "SENDER_ADDRESS=${SENDER_ADDRESS}" \
-            "AzureWebJobsFeatureFlags=EnableWorkerIndexing" \
-            "SCM_DO_BUILD_DURING_DEPLOYMENT=true" \
-            "ENABLE_ORYX_BUILD=true" \
-        --output none 2>/dev/null
+    if [ "$EMAIL_BACKEND" = "graph" ]; then
+        az functionapp config appsettings set \
+            --name "$FUNC_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings \
+                "EMAIL_BACKEND=graph" \
+                "SENDER_ADDRESS=${SENDER_ADDRESS}" \
+                "AzureWebJobsFeatureFlags=EnableWorkerIndexing" \
+                "SCM_DO_BUILD_DURING_DEPLOYMENT=true" \
+                "ENABLE_ORYX_BUILD=true" \
+            --output none 2>/dev/null
+    else
+        az functionapp config appsettings set \
+            --name "$FUNC_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --settings \
+                "EMAIL_BACKEND=acs" \
+                "ACS_ENDPOINT=${ACS_ENDPOINT}" \
+                "SENDER_ADDRESS=${SENDER_ADDRESS}" \
+                "AzureWebJobsFeatureFlags=EnableWorkerIndexing" \
+                "SCM_DO_BUILD_DURING_DEPLOYMENT=true" \
+                "ENABLE_ORYX_BUILD=true" \
+            --output none 2>/dev/null
+    fi
     success "Function App settings configured."
 
     # Get Function App URL
@@ -1056,8 +1243,10 @@ deploy() {
     divider
     deploy_resource_group
     divider
-    deploy_acs
-    divider
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        deploy_acs
+        divider
+    fi
     deploy_app_registration
     divider
     deploy_role_assignments
@@ -1066,6 +1255,10 @@ deploy() {
     divider
     deploy_function_code
     divider
+    if [ "$EMAIL_BACKEND" = "graph" ]; then
+        deploy_graph_oauth
+        divider
+    fi
 
     echo ""
     echo "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════════╗${RESET}"
@@ -1190,81 +1383,88 @@ status() {
     RESOURCE_GROUP=$(load_config "RESOURCE_GROUP" "")
     APP_CLIENT_ID=$(load_config "APP_CLIENT_ID" "")
     FUNC_APP_NAME=$(load_config "FUNC_APP_NAME" "")
-    ACS_NAME=$(load_config "ACS_NAME" "")
-    EMAIL_SERVICE_NAME=$(load_config "EMAIL_SERVICE_NAME" "")
     FUNC_APP_URL=$(load_config "FUNC_APP_URL" "")
     SENDER_ADDRESS=$(load_config "SENDER_ADDRESS" "")
-    SENDER_DOMAIN=$(load_config "SENDER_DOMAIN" "")
+    EMAIL_BACKEND=$(load_config "EMAIL_BACKEND" "acs")
 
     if [ -n "$SUBSCRIPTION_ID" ]; then
         az account set --subscription "$SUBSCRIPTION_ID" >/dev/null 2>&1 || true
     fi
 
-    # Auto-refresh ACS endpoint if it was empty during initial deploy
-    local ACS_ENDPOINT
-    ACS_ENDPOINT=$(load_config "ACS_ENDPOINT" "")
-    if [ -z "$ACS_ENDPOINT" ] && [ -n "$ACS_NAME" ]; then
-        info "ACS endpoint was empty — checking if it's available now..."
-        local refreshed_endpoint
-        refreshed_endpoint=$(az rest --method GET \
-            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/communicationServices/${ACS_NAME}?api-version=${API_VERSION_COMM}" \
-            --query "properties.hostName" -o tsv 2>/dev/null || echo "")
-        if [ -n "$refreshed_endpoint" ] && [ "$refreshed_endpoint" != "None" ]; then
-            ACS_ENDPOINT="https://${refreshed_endpoint}"
-            save_config "ACS_ENDPOINT" "$ACS_ENDPOINT"
-            success "ACS endpoint resolved: ${BOLD}${ACS_ENDPOINT}${RESET}"
-            # Update function app settings with resolved endpoint
-            if [ -n "$FUNC_APP_NAME" ]; then
-                info "Updating Function App ACS endpoint..."
-                az functionapp config appsettings set \
-                    --name "$FUNC_APP_NAME" \
-                    --resource-group "$RESOURCE_GROUP" \
-                    --settings "ACS_ENDPOINT=${ACS_ENDPOINT}" \
-                    --output none 2>/dev/null && success "Function App ACS endpoint updated."
-            fi
-        else
-            warn "ACS endpoint still unavailable."
-        fi
-        echo ""
-    fi
+    local ACS_ENDPOINT=""
+    local SENDER_DOMAIN=""
 
-    # Auto-refresh sender domain if it was pending during initial deploy
-    if [ "$SENDER_DOMAIN" = "pending" ] && [ -n "$EMAIL_SERVICE_NAME" ]; then
-        info "Sender domain was pending — checking if it's available now..."
-        local refreshed_domain
-        refreshed_domain=$(az rest --method GET \
-            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}/domains/AzureManagedDomain?api-version=${API_VERSION_EMAIL}" \
-            --query "properties.fromSenderDomain" -o tsv 2>/dev/null || echo "")
-        if [ -n "$refreshed_domain" ] && [ "$refreshed_domain" != "None" ]; then
-            SENDER_DOMAIN="$refreshed_domain"
-            SENDER_ADDRESS="DoNotReply@${SENDER_DOMAIN}"
-            save_config "SENDER_DOMAIN" "$SENDER_DOMAIN"
-            save_config "SENDER_ADDRESS" "$SENDER_ADDRESS"
-            success "Sender domain resolved: ${BOLD}${SENDER_DOMAIN}${RESET}"
-            # Update function app settings with resolved sender address
-            if [ -n "$FUNC_APP_NAME" ]; then
-                info "Updating Function App sender address..."
-                az functionapp config appsettings set \
-                    --name "$FUNC_APP_NAME" \
-                    --resource-group "$RESOURCE_GROUP" \
-                    --settings "SENDER_ADDRESS=${SENDER_ADDRESS}" \
-                    --output none 2>/dev/null && success "Function App sender address updated."
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        ACS_NAME=$(load_config "ACS_NAME" "")
+        EMAIL_SERVICE_NAME=$(load_config "EMAIL_SERVICE_NAME" "")
+        SENDER_DOMAIN=$(load_config "SENDER_DOMAIN" "")
+
+        # Auto-refresh ACS endpoint if it was empty during initial deploy
+        ACS_ENDPOINT=$(load_config "ACS_ENDPOINT" "")
+        if [ -z "$ACS_ENDPOINT" ] && [ -n "$ACS_NAME" ]; then
+            info "ACS endpoint was empty — checking if it's available now..."
+            local refreshed_endpoint
+            refreshed_endpoint=$(az rest --method GET \
+                --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/communicationServices/${ACS_NAME}?api-version=${API_VERSION_COMM}" \
+                --query "properties.hostName" -o tsv 2>/dev/null || echo "")
+            if [ -n "$refreshed_endpoint" ] && [ "$refreshed_endpoint" != "None" ]; then
+                ACS_ENDPOINT="https://${refreshed_endpoint}"
+                save_config "ACS_ENDPOINT" "$ACS_ENDPOINT"
+                success "ACS endpoint resolved: ${BOLD}${ACS_ENDPOINT}${RESET}"
+                if [ -n "$FUNC_APP_NAME" ]; then
+                    info "Updating Function App ACS endpoint..."
+                    az functionapp config appsettings set \
+                        --name "$FUNC_APP_NAME" \
+                        --resource-group "$RESOURCE_GROUP" \
+                        --settings "ACS_ENDPOINT=${ACS_ENDPOINT}" \
+                        --output none 2>/dev/null && success "Function App ACS endpoint updated."
+                fi
+            else
+                warn "ACS endpoint still unavailable."
             fi
-        else
-            warn "Sender domain still pending."
+            echo ""
         fi
-        echo ""
+
+        # Auto-refresh sender domain if it was pending during initial deploy
+        if [ "$SENDER_DOMAIN" = "pending" ] && [ -n "$EMAIL_SERVICE_NAME" ]; then
+            info "Sender domain was pending — checking if it's available now..."
+            local refreshed_domain
+            refreshed_domain=$(az rest --method GET \
+                --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Communication/emailServices/${EMAIL_SERVICE_NAME}/domains/AzureManagedDomain?api-version=${API_VERSION_EMAIL}" \
+                --query "properties.fromSenderDomain" -o tsv 2>/dev/null || echo "")
+            if [ -n "$refreshed_domain" ] && [ "$refreshed_domain" != "None" ]; then
+                SENDER_DOMAIN="$refreshed_domain"
+                SENDER_ADDRESS="DoNotReply@${SENDER_DOMAIN}"
+                save_config "SENDER_DOMAIN" "$SENDER_DOMAIN"
+                save_config "SENDER_ADDRESS" "$SENDER_ADDRESS"
+                success "Sender domain resolved: ${BOLD}${SENDER_DOMAIN}${RESET}"
+                if [ -n "$FUNC_APP_NAME" ]; then
+                    info "Updating Function App sender address..."
+                    az functionapp config appsettings set \
+                        --name "$FUNC_APP_NAME" \
+                        --resource-group "$RESOURCE_GROUP" \
+                        --settings "SENDER_ADDRESS=${SENDER_ADDRESS}" \
+                        --output none 2>/dev/null && success "Function App sender address updated."
+                fi
+            else
+                warn "Sender domain still pending."
+            fi
+            echo ""
+        fi
     fi
 
     echo "  ${BOLD}Configuration:${RESET}"
+    echo "    Email Backend:    ${BOLD}${EMAIL_BACKEND}${RESET}"
     echo "    Subscription:     ${SUBSCRIPTION_ID}"
     echo "    Resource Group:   ${RESOURCE_GROUP}"
     echo "    App Client ID:    ${APP_CLIENT_ID}"
     echo "    Function App:     ${FUNC_APP_NAME}"
     echo "    Function URL:     ${FUNC_APP_URL}"
-    echo "    ACS Resource:     ${ACS_NAME}"
-    echo "    ACS Endpoint:     ${ACS_ENDPOINT:-${YELLOW}empty${RESET}}"
     echo "    Sender Address:   ${SENDER_ADDRESS}"
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        echo "    ACS Resource:     ${ACS_NAME}"
+        echo "    ACS Endpoint:     ${ACS_ENDPOINT:-${YELLOW}empty${RESET}}"
+    fi
     echo ""
 
     # Check resource group existence
@@ -1315,11 +1515,22 @@ status() {
         echo "    Function App:     ${RED}not found${RESET}"
     fi
 
-    # Check sender domain
-    if [ "$SENDER_DOMAIN" = "pending" ] || [ -z "$SENDER_DOMAIN" ]; then
-        echo "    Sender Domain:    ${YELLOW}pending${RESET}"
+    # Backend-specific checks
+    if [ "$EMAIL_BACKEND" = "acs" ]; then
+        if [ "$SENDER_DOMAIN" = "pending" ] || [ -z "$SENDER_DOMAIN" ]; then
+            echo "    Sender Domain:    ${YELLOW}pending${RESET}"
+        else
+            echo "    Sender Domain:    ${GREEN}${SENDER_DOMAIN}${RESET}"
+        fi
     else
-        echo "    Sender Domain:    ${GREEN}${SENDER_DOMAIN}${RESET}"
+        # Graph backend — check refresh token is present
+        local has_token
+        has_token=$(load_config "GRAPH_REFRESH_TOKEN" "")
+        if [ -n "$has_token" ]; then
+            echo "    Graph Token:      ${GREEN}configured${RESET}"
+        else
+            echo "    Graph Token:      ${RED}not configured${RESET}"
+        fi
     fi
 
     echo ""

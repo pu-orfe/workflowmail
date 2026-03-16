@@ -1,7 +1,10 @@
-# WorkflowMail - Example GitHub Action for sending email via Azure OIDC + ACS
+# WorkflowMail - Example GitHub Action for sending email via Azure OIDC
 #
-# 100% secretless: No passwords, tokens, or keys stored in GitHub.
-# Authentication uses OpenID Connect (OIDC) Workload Identity Federation.
+# No passwords, tokens, or keys stored in GitHub.
+# GitHub authenticates to Azure via OpenID Connect (OIDC) — no stored secrets
+# on the GitHub side. The Azure Function handles email delivery using either
+# ACS (Managed Identity, secretless end-to-end) or Graph (OAuth refresh token
+# stored in Function App settings, encrypted at rest).
 #
 # Required GitHub repository variables (NOT secrets — these are public IDs):
 #   AZURE_CLIENT_ID       - App Registration client ID

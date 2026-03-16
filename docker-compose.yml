@@ -5,8 +5,12 @@ services:
     ports:
       - "7071:80"
     environment:
+      - EMAIL_BACKEND=${EMAIL_BACKEND:-acs}
       - ACS_ENDPOINT=${ACS_ENDPOINT:-https://your-acs.communication.azure.com}
       - SENDER_ADDRESS=${SENDER_ADDRESS:-DoNotReply@example.azurecomm.net}
+      - GRAPH_TENANT_ID=${GRAPH_TENANT_ID:-}
+      - GRAPH_CLIENT_ID=${GRAPH_CLIENT_ID:-}
+      - GRAPH_REFRESH_TOKEN=${GRAPH_REFRESH_TOKEN:-}
       - AzureWebJobsStorage=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;QueueEndpoint=http://azurite:10001/devstoreaccount1;TableEndpoint=http://azurite:10002/devstoreaccount1
     volumes:
       - ./function:/home/site/wwwroot:ro
