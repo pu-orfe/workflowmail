@@ -1,27 +1,30 @@
 # WorkflowMail
 
-Email delivery from GitHub Actions via Azure. Two backends:
+Email delivery from GitHub Actions via Azure. Three backends:
 
 - **ACS** (default) — Azure Communication Services with Managed Identity. Fully secretless for GitHub OIDC callers. Sends from `DoNotReply@<guid>.azurecomm.net`.
-- **Graph** — Microsoft Graph API with OAuth refresh token. Sends as a real O365 mailbox (e.g., `noreply@contoso.com`). Uses delegated permissions — no admin consent required.
+- **Graph** — Microsoft Graph API with OAuth refresh token. Sends as a real O365 mailbox (e.g., `noreply@contoso.com`). Uses delegated `Mail.Send` — no admin consent required.
+- **SMTP** — SMTP with OAuth XOAUTH2. Sends as a real O365 mailbox via `smtp.office365.com`. Uses delegated `SMTP.Send` — no admin consent required. Ideal when your tenant blocks Graph `Mail.Send` consent.
 
 ```
-ACS:   GitHub Action → OIDC → Azure → Function → Managed Identity → ACS Email
+ACS:  GitHub Action → OIDC → Azure → Function → Managed Identity → ACS Email
 Graph: GitHub Action → OIDC → Azure → Function → OAuth Token → Graph sendMail
+SMTP: GitHub Action → OIDC → Azure → Function → OAuth XOAUTH2 → SMTP
 ```
 
-> **Secretless?** Only the ACS backend with GitHub Actions OIDC is truly secretless end-to-end — no credentials stored anywhere (not in GitHub, not in Azure). The Graph backend stores an OAuth refresh token in Azure Function App settings (encrypted at rest). Non-OIDC integrations (e.g., Drupal Webforms) require a static function key regardless of backend. See [Security Model](#security-model) for the full breakdown.
+> **Secretless?** Only the ACS backend with GitHub Actions OIDC is truly secretless end-to-end — no credentials stored anywhere (not in GitHub, not in Azure). The Graph and SMTP backends store an OAuth refresh token in Azure Function App settings (encrypted at rest). Non-OIDC integrations (e.g., Drupal Webforms) require a static function key regardless of backend. See [Security Model](#security-model) for the full breakdown.
 
 ## Email Backends
 
-| | ACS (default) | Graph |
-|---|---|---|
-| **Sender address** | `DoNotReply@<guid>.azurecomm.net` | Any O365 mailbox (e.g., `noreply@contoso.com`) |
-| **Authentication** | Managed Identity (no stored credentials) | OAuth refresh token (stored in Azure) |
-| **Admin consent** | Not required | Not required (delegated `Mail.Send`) |
-| **Setup** | Automatic (deploy creates ACS resources) | One-time device code login during deploy |
-| **Token maintenance** | None | Automatic weekly heartbeat timer |
-| **Azure resources** | ACS + Email Service + domain | Function App only (no ACS) |
+| | ACS (default) | Graph | SMTP |
+|---|---|---|---|
+| **Sender address** | `DoNotReply@<guid>.azurecomm.net` | Any O365 mailbox | Any O365 mailbox |
+| **Authentication** | Managed Identity (no stored credentials) | OAuth refresh token (stored in Azure) | OAuth refresh token (stored in Azure) |
+| **Admin consent** | Not required | Not required (delegated `Mail.Send`) | Not required (delegated `SMTP.Send`) |
+| **Setup** | Automatic (deploy creates ACS resources) | One-time device code login during deploy | One-time device code login during deploy |
+| **Token maintenance** | None | Automatic weekly heartbeat timer | Automatic weekly heartbeat timer |
+| **Azure resources** | ACS + Email Service + domain | Function App only (no ACS) | Function App only (no ACS) |
+| **Tenant compatibility** | All | Requires `Mail.Send` consent | Works when `Mail.Send` is blocked |
 
 ## Prerequisites
 
@@ -31,29 +34,33 @@ Graph: GitHub Action → OIDC → Azure → Function → OAuth Token → Graph s
 - [GitHub CLI](https://cli.github.com/) (`gh`) — optional, for auto-setting repo variables
 - An Azure subscription with permission to create resources
 - A GitHub repository (or organization) where you want to send email
-- **Graph backend only:** An O365 mailbox account to authenticate as during deployment
+- **Graph/SMTP backend only:** An O365 mailbox account to authenticate as during deployment
+- **SMTP backend only:** SMTP AUTH must be enabled on the sending mailbox (check in Microsoft 365 admin center → Users → Active users → select user → Mail → Manage email apps → Authenticated SMTP)
 
 ## Quick Start
 
 ```bash
 # Deploy the full stack interactively (prompts for backend choice)
-./deploy.sh deploy
+./scripts/deploy.sh deploy
 
 # Check deployment status
-./deploy.sh status
+./scripts/deploy.sh status
 
 # Send a test email to verify everything works
-./deploy.sh test
+./scripts/deploy.sh test
+
+# Update security settings without redeploying code
+./scripts/deploy.sh update-settings
 
 # Tear down all resources when done
-./deploy.sh teardown
+./scripts/deploy.sh teardown
 ```
 
 The deploy script is interactive — it prompts for your Azure subscription, tenant, GitHub org/repo, email backend, and resource naming preferences. Configuration is saved to `.workflowmail.conf` for subsequent runs.
 
 ### Graph Backend Setup
 
-When you choose the `graph` backend during `./deploy.sh deploy`:
+When you choose the `graph` backend during `./scripts/deploy.sh deploy`:
 
 1. The script creates the standard Azure resources (resource group, function app, app registration)
 2. It adds delegated `Mail.Send` + `offline_access` permissions to the app registration
@@ -62,20 +69,37 @@ When you choose the `graph` backend during `./deploy.sh deploy`:
 5. The refresh token is stored as an encrypted Function App setting
 6. A weekly timer function keeps the token alive (90-day inactivity timeout, reset on each use)
 
+If consent fails (tenant blocks `Mail.Send`), the deploy script offers to fall back to the SMTP backend automatically.
+
+### SMTP Backend Setup
+
+When you choose the `smtp` backend during `./scripts/deploy.sh deploy`:
+
+1. The script creates the standard Azure resources (resource group, function app)
+2. It initiates a **device code flow** using the Thunderbird client ID (default) with the `SMTP.Send` scope
+3. Sign in as the O365 mailbox account and consent
+4. The refresh token is stored as an encrypted Function App setting
+5. The function sends email via `smtp.office365.com:587` using XOAUTH2 authentication
+6. A weekly timer function keeps the token alive
+
+The SMTP backend uses the `SMTP.Send` scope from Exchange Online (not Microsoft Graph). This scope is typically pre-approved for the Thunderbird client ID, making it work in tenants that block custom app consent for Graph's `Mail.Send`.
+
 ## What Gets Created
 
-| Resource | ACS Backend | Graph Backend |
-|----------|:-----------:|:-------------:|
-| Resource Group | Yes | Yes |
-| Azure Communication Services | Yes | No |
-| Email Service + Azure-managed domain | Yes | No |
-| App Registration + Service Principal | Yes | Yes |
-| Federated Credential (OIDC) | Yes | Yes |
-| Azure Function App (Python, Linux) | Yes | Yes |
-| Storage Account | Yes | Yes |
-| MI → ACS role assignment | Yes | No |
-| SP → RG role assignment | Yes | Yes |
-| Refresh token (Function App setting) | No | Yes |
+| Resource | ACS Backend | Graph Backend | SMTP Backend |
+|----------|:-----------:|:-------------:|:------------:|
+| Resource Group | Yes | Yes | Yes |
+| Azure Communication Services | Yes | No | No |
+| Email Service + Azure-managed domain | Yes | No | No |
+| App Registration + Service Principal | Yes | Yes | Optional* |
+| Federated Credential (OIDC) | Yes | Yes | Yes |
+| Azure Function App (Python, Linux) | Yes | Yes | Yes |
+| Storage Account | Yes | Yes | Yes |
+| MI → ACS role assignment | Yes | No | No |
+| SP → RG role assignment | Yes | Yes | Yes |
+| Refresh token (Function App setting) | No | Yes | Yes |
+
+*SMTP with the default Thunderbird identity needs no app registration for the OAuth flow. Only created if OIDC or "own app" auth method is selected.
 
 ## Using in Your Workflow
 
@@ -159,7 +183,7 @@ For cross-repo use, add federated credentials for each calling repo:
 
 ```bash
 # Interactively add OIDC trust for another repo
-./deploy.sh add-cred
+./scripts/deploy.sh add-cred
 ```
 
 This creates a federated credential and optionally sets the required GitHub variables on the target repo via `gh` CLI.
@@ -236,8 +260,29 @@ The Azure Function accepts POST requests to `/api/send`:
 - `to` — Single email string or array of strings
 - `subject` — Required
 - `body` — Plain text content
-- `html` — HTML content (optional; with ACS backend both are sent, with Graph backend HTML takes precedence)
-- `sender` — Override the default sender address (optional). For ACS this must be a verified domain address. For Graph this must be a mailbox the authenticated user can send as.
+- `html` — HTML content (optional; with ACS both are sent, with Graph HTML takes precedence, with SMTP both are sent as `multipart/alternative`)
+- `sender` — Override the default sender address (optional). For ACS this must be a verified domain address. For Graph/SMTP this must be a mailbox the authenticated user can send as.
+
+## Security Settings
+
+Three optional environment variables restrict how the function can be used. All are backward compatible — empty or unset means disabled (unrestricted). Configure them during `./scripts/deploy.sh deploy` or update later with `./scripts/deploy.sh update-settings`.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ALLOWED_RECIPIENTS` | *(empty)* | Comma-separated list of exact email addresses. Requests to other addresses are rejected with **403**. Case-insensitive. |
+| `RATE_LIMIT_PER_MINUTE` | `10` | Sliding-window rate limit per function instance. Requests beyond the limit are rejected with **429**. Set to `0` to disable. |
+| `SUBJECT_PATTERN` | *(empty)* | Regex pattern (Python `re.search`). Subjects that don't match are rejected with **400**. |
+
+### Example: Lock down to Listserv commands
+
+```bash
+# Only allow subscribe/unsubscribe commands to the Listserv address
+ALLOWED_RECIPIENTS=listserv@lists.example.edu
+RATE_LIMIT_PER_MINUTE=10
+SUBJECT_PATTERN='^(SUBSCRIBE|SIGNOFF)\s+.+'
+```
+
+These settings are pushed as Azure Function App settings (no code redeploy needed) and are also available for local development via `docker-compose.yml` environment variables.
 
 ## Local Development
 
@@ -251,6 +296,20 @@ EMAIL_BACKEND=graph \
   GRAPH_CLIENT_ID=... \
   GRAPH_REFRESH_TOKEN=... \
   SENDER_ADDRESS=noreply@contoso.com \
+  docker-compose up --build
+
+# Run locally with SMTP backend
+EMAIL_BACKEND=smtp \
+  GRAPH_TENANT_ID=... \
+  GRAPH_CLIENT_ID=... \
+  GRAPH_REFRESH_TOKEN=... \
+  SENDER_ADDRESS=noreply@contoso.com \
+  docker-compose up --build
+
+# Override security settings for local testing
+ALLOWED_RECIPIENTS=listserv@lists.example.edu \
+  RATE_LIMIT_PER_MINUTE=0 \
+  SUBJECT_PATTERN='' \
   docker-compose up --build
 
 # The function is available at http://localhost:7071/api/send
@@ -277,18 +336,32 @@ EMAIL_BACKEND=graph \
 - **Token lifecycle:** The refresh token is NOT revoked by password changes (device code flow tokens are non-password-based). It is only revoked by explicit admin action or user self-service token revocation.
 - **Blast radius** — If the token is compromised, the attacker can send email as the authenticated mailbox. They cannot read email, access other users, or perform any other Graph operations.
 
+**SMTP backend (credential stored in Azure):**
+- **Same credential model as Graph.** Stores an OAuth refresh token in Azure Function App settings (encrypted at rest). The GitHub side remains secret-free.
+- **Delegated permissions** — The token grants `SMTP.Send` only. This is an Exchange Online scope (not Graph) — it cannot read email, access contacts, or call any Graph APIs.
+- **Weekly heartbeat** — Same as Graph: a timer function refreshes the token weekly.
+- **Blast radius** — If the token is compromised, the attacker can send email as the authenticated mailbox via SMTP. More limited than Graph's `Mail.Send` — SMTP only supports sending, with no API access to the mailbox.
+- **SMTP AUTH requirement** — The sending mailbox must have SMTP AUTH enabled (may require admin action in the Microsoft 365 admin center).
+
 **Non-OIDC clients (Drupal, scripts, etc.):**
 - **Function key required** — External callers authenticate with a static function key passed in the URL. This is a stored credential — treat it like a password.
 - **Scoped blast radius** — The key only grants access to the email-sending endpoint. It cannot access other Azure resources.
 - **Rotation** — Rotate keys with `az functionapp function keys set`.
 
+**Application-level restrictions (all backends):**
+- **Recipient allowlist** (`ALLOWED_RECIPIENTS`) — Limits who can receive email. Blocks requests to unauthorized addresses with 403.
+- **Rate limiting** (`RATE_LIMIT_PER_MINUTE`) — Sliding-window rate limiter per function instance. Blocks excess requests with 429.
+- **Subject pattern** (`SUBJECT_PATTERN`) — Regex validation on the email subject. Blocks non-matching requests with 400.
+- These settings are enforced in the function itself, before any email is sent, regardless of backend or authentication method. See [Security Settings](#security-settings).
+
 ## File Structure
 
 ```
 .
-├── deploy.sh                              # Deploy/teardown/status/test script
+├── scripts/
+│   └── deploy.sh                          # Deploy/teardown/status/test script
 ├── function/
-│   ├── function_app.py                    # Azure Function (Python v2, ACS + Graph)
+│   ├── function_app.py                    # Azure Function (Python v2, ACS + Graph + SMTP)
 │   ├── test_function_app.py               # Unit tests
 │   ├── requirements.txt                   # Python dependencies
 │   ├── host.json                          # Functions host config
@@ -305,7 +378,7 @@ EMAIL_BACKEND=graph \
 ## Teardown
 
 ```bash
-./deploy.sh teardown
+./scripts/deploy.sh teardown
 ```
 
 This deletes:
@@ -313,7 +386,7 @@ This deletes:
 - The App Registration and Service Principal
 - The local `.workflowmail.conf` file
 
-The Graph refresh token is stored as a Function App setting and is deleted with the resource group. Remember to also remove the GitHub repository variables (`AZURE_CLIENT_ID`, etc.) after teardown.
+The OAuth refresh token (Graph or SMTP) is stored as a Function App setting and is deleted with the resource group. Remember to also remove the GitHub repository variables (`AZURE_CLIENT_ID`, etc.) after teardown.
 
 ## License
 

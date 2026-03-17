@@ -1,7 +1,8 @@
-"""Tests for WorkflowMail Azure Function — ACS and Graph backends."""
+"""Tests for WorkflowMail Azure Function — ACS, Graph, and SMTP backends."""
 
 import json
 import os
+import time
 from unittest import mock
 
 import azure.functions as func
@@ -23,10 +24,14 @@ def _clean_env():
         "GRAPH_TENANT_ID",
         "GRAPH_CLIENT_ID",
         "GRAPH_REFRESH_TOKEN",
+        "ALLOWED_RECIPIENTS",
+        "RATE_LIMIT_PER_MINUTE",
+        "SUBJECT_PATTERN",
     ]
     with mock.patch.dict(os.environ, {}, clear=False):
         for k in keys:
             os.environ.pop(k, None)
+        function_app._request_timestamps.clear()
         yield
 
 
@@ -234,6 +239,113 @@ class TestSendViaGraph:
         assert recipients[1]["emailAddress"]["address"] == "b@example.com"
 
 
+# ── SMTP backend tests ──────────────────────────────────────────────
+
+
+class TestSendViaSmtp:
+    def _setup_smtp_env(self):
+        os.environ["GRAPH_TENANT_ID"] = "tenant-123"
+        os.environ["GRAPH_CLIENT_ID"] = "client-456"
+        os.environ["GRAPH_REFRESH_TOKEN"] = "refresh-789"
+
+    def _mock_token_response(self):
+        resp = mock.MagicMock()
+        resp.json.return_value = {"access_token": "at-smtp"}
+        resp.raise_for_status = mock.MagicMock()
+        return resp
+
+    def test_send_success(self):
+        self._setup_smtp_env()
+        mock_server = mock.MagicMock()
+
+        with mock.patch("function_app.requests.post", return_value=self._mock_token_response()) as mock_post, \
+             mock.patch("function_app.smtplib.SMTP", return_value=mock_server):
+            msg_id = function_app._send_via_smtp(
+                "noreply@contoso.com",
+                ["to@example.com"],
+                "SMTP Test",
+                "Hello via SMTP",
+                "",
+            )
+
+        assert msg_id.startswith("smtp-")
+        # Verify token exchange used SMTP.Send scope
+        call_data = mock_post.call_args[1]["data"]
+        assert "SMTP.Send" in call_data["scope"]
+        # Verify SMTP interactions
+        mock_server.ehlo.assert_called()
+        mock_server.starttls.assert_called_once()
+        mock_server.auth.assert_called_once()
+        assert mock_server.auth.call_args[0][0] == "XOAUTH2"
+        mock_server.sendmail.assert_called_once()
+        mock_server.quit.assert_called_once()
+
+    def test_send_html_and_plain(self):
+        self._setup_smtp_env()
+        mock_server = mock.MagicMock()
+
+        with mock.patch("function_app.requests.post", return_value=self._mock_token_response()), \
+             mock.patch("function_app.smtplib.SMTP", return_value=mock_server):
+            function_app._send_via_smtp(
+                "noreply@contoso.com",
+                ["to@example.com"],
+                "Multi Test",
+                "plain text",
+                "<p>html</p>",
+            )
+
+        sent_msg = mock_server.sendmail.call_args[0][2]
+        assert "multipart/alternative" in sent_msg
+        assert "plain text" in sent_msg
+        assert "<p>html</p>" in sent_msg
+
+    def test_send_html_only(self):
+        self._setup_smtp_env()
+        mock_server = mock.MagicMock()
+
+        with mock.patch("function_app.requests.post", return_value=self._mock_token_response()), \
+             mock.patch("function_app.smtplib.SMTP", return_value=mock_server):
+            function_app._send_via_smtp(
+                "noreply@contoso.com",
+                ["to@example.com"],
+                "HTML Only",
+                "",
+                "<h1>Hello</h1>",
+            )
+
+        sent_msg = mock_server.sendmail.call_args[0][2]
+        assert "<h1>Hello</h1>" in sent_msg
+        assert "text/html" in sent_msg
+
+    def test_missing_env_raises(self):
+        with pytest.raises(ValueError, match="SMTP backend requires"):
+            function_app._send_via_smtp(
+                "noreply@contoso.com",
+                ["to@example.com"],
+                "Test",
+                "body",
+                "",
+            )
+
+    def test_multiple_recipients(self):
+        self._setup_smtp_env()
+        mock_server = mock.MagicMock()
+
+        with mock.patch("function_app.requests.post", return_value=self._mock_token_response()), \
+             mock.patch("function_app.smtplib.SMTP", return_value=mock_server):
+            function_app._send_via_smtp(
+                "noreply@contoso.com",
+                ["a@example.com", "b@example.com"],
+                "Multi Rcpt",
+                "body",
+                "",
+            )
+
+        call_args = mock_server.sendmail.call_args[0]
+        assert call_args[0] == "noreply@contoso.com"
+        assert call_args[1] == ["a@example.com", "b@example.com"]
+
+
 # ── Backend dispatch tests ────────────────────────────────────────────
 
 
@@ -294,6 +406,34 @@ class TestBackendDispatch:
         data = json.loads(resp.get_body())
         assert data["status"] == "sent"
         assert data["messageId"].startswith("graph-")
+
+    def test_smtp_backend_dispatch(self):
+        os.environ["EMAIL_BACKEND"] = "smtp"
+        os.environ["SENDER_ADDRESS"] = "noreply@contoso.com"
+        os.environ["GRAPH_TENANT_ID"] = "tenant-123"
+        os.environ["GRAPH_CLIENT_ID"] = "client-456"
+        os.environ["GRAPH_REFRESH_TOKEN"] = "refresh-789"
+
+        token_response = mock.MagicMock()
+        token_response.json.return_value = {"access_token": "at-smtp"}
+        token_response.raise_for_status = mock.MagicMock()
+
+        mock_server = mock.MagicMock()
+
+        req = _make_request({
+            "to": "to@example.com",
+            "subject": "SMTP Dispatch",
+            "body": "Hello SMTP",
+        })
+
+        with mock.patch("function_app.requests.post", return_value=token_response), \
+             mock.patch("function_app.smtplib.SMTP", return_value=mock_server):
+            resp = function_app.send_email(req)
+
+        assert resp.status_code == 200
+        data = json.loads(resp.get_body())
+        assert data["status"] == "sent"
+        assert data["messageId"].startswith("smtp-")
 
     def test_graph_backend_no_acs_endpoint_needed(self):
         """Graph backend should not check ACS_ENDPOINT."""
@@ -432,6 +572,25 @@ class TestHeartbeat:
         # Should not raise
         function_app.graph_token_heartbeat(timer)
 
+    def test_heartbeat_runs_for_smtp(self):
+        os.environ["EMAIL_BACKEND"] = "smtp"
+        os.environ["GRAPH_TENANT_ID"] = "tenant-123"
+        os.environ["GRAPH_CLIENT_ID"] = "client-456"
+        os.environ["GRAPH_REFRESH_TOKEN"] = "refresh-789"
+
+        token_response = mock.MagicMock()
+        token_response.json.return_value = {"access_token": "at-smtp-heartbeat"}
+        token_response.raise_for_status = mock.MagicMock()
+
+        timer = mock.MagicMock()
+
+        with mock.patch("function_app.requests.post", return_value=token_response) as mock_post:
+            function_app.graph_token_heartbeat(timer)
+
+        mock_post.assert_called_once()
+        call_data = mock_post.call_args[1]["data"]
+        assert "SMTP.Send" in call_data["scope"]
+
 
 # ── Token exchange tests ──────────────────────────────────────────────
 
@@ -462,3 +621,175 @@ class TestTokenExchange:
                 function_app._exchange_graph_refresh_token(
                     "tenant-id", "client-id", "bad-token"
                 )
+
+    def test_smtp_exchange_uses_correct_scope(self):
+        mock_resp = mock.MagicMock()
+        mock_resp.json.return_value = {"access_token": "smtp-at"}
+        mock_resp.raise_for_status = mock.MagicMock()
+
+        with mock.patch("function_app.requests.post", return_value=mock_resp) as mock_post:
+            token = function_app._exchange_smtp_refresh_token(
+                "tenant-id", "client-id", "refresh-token"
+            )
+
+        assert token == "smtp-at"
+        call_data = mock_post.call_args[1]["data"]
+        assert call_data["scope"] == "https://outlook.office365.com/SMTP.Send offline_access"
+
+
+# ── Recipient restriction tests ────────────────────────────────────
+
+
+class TestRecipientRestrictions:
+    """Tests for ALLOWED_RECIPIENTS enforcement."""
+
+    def _send(self, to, subject="Test Subject"):
+        os.environ["SENDER_ADDRESS"] = "sender@test.azurecomm.net"
+        os.environ["ACS_ENDPOINT"] = "https://test.communication.azure.com"
+        mock_poller = mock.MagicMock()
+        mock_poller.result.return_value = {"id": "acs-rcpt-1"}
+        mock_client = mock.MagicMock()
+        mock_client.begin_send.return_value = mock_poller
+
+        req = _make_request({"to": to, "subject": subject, "body": "body"})
+        with mock.patch("function_app.DefaultAzureCredential"), \
+             mock.patch("function_app.EmailClient", return_value=mock_client):
+            return function_app.send_email(req)
+
+    def test_unset_allows_all(self):
+        resp = self._send("anyone@example.com")
+        assert resp.status_code == 200
+
+    def test_empty_allows_all(self):
+        os.environ["ALLOWED_RECIPIENTS"] = ""
+        resp = self._send("anyone@example.com")
+        assert resp.status_code == 200
+
+    def test_allowed_passes(self):
+        os.environ["ALLOWED_RECIPIENTS"] = "ok@example.com,another@example.com"
+        resp = self._send("ok@example.com")
+        assert resp.status_code == 200
+
+    def test_blocked_returns_403(self):
+        os.environ["ALLOWED_RECIPIENTS"] = "ok@example.com"
+        resp = self._send("hacker@evil.com")
+        assert resp.status_code == 403
+        data = json.loads(resp.get_body())
+        assert "not allowed" in data["error"]
+
+    def test_case_insensitive(self):
+        os.environ["ALLOWED_RECIPIENTS"] = "OK@Example.COM"
+        resp = self._send("ok@example.com")
+        assert resp.status_code == 200
+
+    def test_multi_recipient_one_blocked(self):
+        os.environ["ALLOWED_RECIPIENTS"] = "ok@example.com"
+        resp = self._send(["ok@example.com", "bad@evil.com"])
+        assert resp.status_code == 403
+
+
+# ── Rate limiting tests ────────────────────────────────────────────
+
+
+class TestRateLimiting:
+    """Tests for RATE_LIMIT_PER_MINUTE enforcement."""
+
+    def _send(self):
+        os.environ["SENDER_ADDRESS"] = "sender@test.azurecomm.net"
+        os.environ["ACS_ENDPOINT"] = "https://test.communication.azure.com"
+        mock_poller = mock.MagicMock()
+        mock_poller.result.return_value = {"id": "acs-rl-1"}
+        mock_client = mock.MagicMock()
+        mock_client.begin_send.return_value = mock_poller
+
+        req = _make_request({"to": "to@example.com", "subject": "Test", "body": "body"})
+        with mock.patch("function_app.DefaultAzureCredential"), \
+             mock.patch("function_app.EmailClient", return_value=mock_client):
+            return function_app.send_email(req)
+
+    def test_default_allows_first(self):
+        resp = self._send()
+        assert resp.status_code == 200
+
+    def test_zero_disables(self):
+        os.environ["RATE_LIMIT_PER_MINUTE"] = "0"
+        for _ in range(20):
+            resp = self._send()
+            assert resp.status_code == 200
+
+    def test_exceeded_returns_429(self):
+        os.environ["RATE_LIMIT_PER_MINUTE"] = "2"
+        assert self._send().status_code == 200
+        assert self._send().status_code == 200
+        assert self._send().status_code == 429
+
+    def test_window_expiration(self):
+        os.environ["RATE_LIMIT_PER_MINUTE"] = "1"
+        # First request at t=0
+        with mock.patch("function_app.time.monotonic", return_value=1000.0):
+            assert self._send().status_code == 200
+        # Second request at t=0.5 — should be rejected
+        with mock.patch("function_app.time.monotonic", return_value=1000.5):
+            assert self._send().status_code == 429
+        # Third request at t=61 — window expired, should pass
+        with mock.patch("function_app.time.monotonic", return_value=1061.0):
+            assert self._send().status_code == 200
+
+    def test_invalid_value_defaults_to_10(self):
+        os.environ["RATE_LIMIT_PER_MINUTE"] = "notanumber"
+        # Default is 10, so first request should pass
+        resp = self._send()
+        assert resp.status_code == 200
+
+
+# ── Subject pattern tests ──────────────────────────────────────────
+
+
+class TestSubjectPattern:
+    """Tests for SUBJECT_PATTERN enforcement."""
+
+    def _send(self, subject):
+        os.environ["SENDER_ADDRESS"] = "sender@test.azurecomm.net"
+        os.environ["ACS_ENDPOINT"] = "https://test.communication.azure.com"
+        mock_poller = mock.MagicMock()
+        mock_poller.result.return_value = {"id": "acs-sp-1"}
+        mock_client = mock.MagicMock()
+        mock_client.begin_send.return_value = mock_poller
+
+        req = _make_request({"to": "to@example.com", "subject": subject, "body": "body"})
+        with mock.patch("function_app.DefaultAzureCredential"), \
+             mock.patch("function_app.EmailClient", return_value=mock_client):
+            return function_app.send_email(req)
+
+    def test_unset_allows_all(self):
+        resp = self._send("Anything goes")
+        assert resp.status_code == 200
+
+    def test_subscribe_matches(self):
+        os.environ["SUBJECT_PATTERN"] = r"^(SUBSCRIBE|SIGNOFF)\s+.+"
+        resp = self._send("SUBSCRIBE MYLIST")
+        assert resp.status_code == 200
+
+    def test_signoff_matches(self):
+        os.environ["SUBJECT_PATTERN"] = r"^(SUBSCRIBE|SIGNOFF)\s+.+"
+        resp = self._send("SIGNOFF MYLIST")
+        assert resp.status_code == 200
+
+    def test_non_matching_returns_400(self):
+        os.environ["SUBJECT_PATTERN"] = r"^(SUBSCRIBE|SIGNOFF)\s+.+"
+        resp = self._send("Hello World")
+        assert resp.status_code == 400
+        data = json.loads(resp.get_body())
+        assert "does not match" in data["error"]
+
+    def test_empty_allows_all(self):
+        os.environ["SUBJECT_PATTERN"] = ""
+        resp = self._send("Anything goes")
+        assert resp.status_code == 200
+
+    def test_invalid_regex_returns_400(self):
+        os.environ["SUBJECT_PATTERN"] = "[invalid"
+        resp = self._send("Test")
+        assert resp.status_code == 400
+        data = json.loads(resp.get_body())
+        assert "Invalid SUBJECT_PATTERN" in data["error"]
